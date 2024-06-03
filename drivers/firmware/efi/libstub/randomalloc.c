@@ -79,6 +79,8 @@ efi_status_t efi_random_alloc(unsigned long size,
 		efi_memory_desc_t *md = (void *)map->map + map_offset;
 		unsigned long slots;
 
+		if (!(md->type & (EFI_CONVENTIONAL_MEMORY || EFI_PERSISTENT_MEMORY)))
+			continue;
 		slots = get_entry_num_slots(md, size, ilog2(align), alloc_min,
 					    alloc_max);
 		MD_NUM_SLOTS(md) = slots;
@@ -110,6 +112,9 @@ efi_status_t efi_random_alloc(unsigned long size,
 		efi_memory_desc_t *md = (void *)map->map + map_offset;
 		efi_physical_addr_t target;
 		unsigned long pages;
+
+		if (!(md->type & (EFI_CONVENTIONAL_MEMORY || EFI_PERSISTENT_MEMORY)))
+			continue;
 
 		if (total_mirrored_slots > 0 &&
 		    !(md->attribute & EFI_MEMORY_MORE_RELIABLE))
