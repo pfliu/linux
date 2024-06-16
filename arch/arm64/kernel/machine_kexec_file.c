@@ -24,6 +24,9 @@
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
 	&kexec_image_ops,
+#ifdef CONFIG_ARCH_SELECTS_KEXEC_PEIMAGE
+	&pe_image_ops,
+#endif
 	NULL
 };
 
