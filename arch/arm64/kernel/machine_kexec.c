@@ -14,6 +14,7 @@
 #include <linux/reboot.h>
 #include <linux/set_memory.h>
 #include <linux/smp.h>
+#include <linux/efi_emulator.h>
 
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
@@ -86,8 +87,22 @@ static void kexec_segment_flush(const struct kimage *kimage)
 	}
 }
 
+/* todo: alloc page for the pgtable used by efi emulator in crashkernel range */
+static phys_addr_t crash_page_alloc(int unused, void *arg)
+{
+	struct kimage *kimage = (struct kimage *)arg;
+	int i;
+
+	//skip kimage->segment[].mem
+	for (i = 0; i < kimage->nr_segments; i ++) {
+		//seg = &kimage->segment[i];
+	}
+	//skip any range allocated
+	return -1;
+}
+
 /* Allocates pages for kexec page table */
-static void *kexec_page_alloc(void *arg)
+static void *__kexec_page_alloc(void *arg)
 {
 	struct kimage *kimage = arg;
 	struct page *page = kimage_alloc_control_pages(kimage, 0);
@@ -102,6 +117,82 @@ static void *kexec_page_alloc(void *arg)
 	return vaddr;
 }
 
+static phys_addr_t kexec_page_alloc(int unused, void *arg)
+{
+	void *vaddr;
+
+	vaddr = __kexec_page_alloc(arg);
+	if (!vaddr)
+		return (phys_addr_t)-1;
+	return virt_to_phys(vaddr);
+}
+
+/*
+ * This function should be called after all kimage segments have been profiled 
+ * Return physical address of page table's root
+ */
+phys_addr_t arch_emulator_prepare_pgtable(struct kimage *kimage,
+		struct efi_emulator_param *param)
+{
+	efi_memory_desc_t *md;
+	struct kexec_segment *seg;
+	unsigned long paddr, vaddr, sz;
+	pgd_t *pgd;
+	typedef phys_addr_t (* alloc_fn)(int, void *);
+	alloc_fn alloc;
+	phys_addr_t pgd_paddr;
+	int i;
+
+	/*
+	 * Set up pgtable of emulator, either for crash or for reboot.
+	 * All of the segments have been profiled, and kimage_alloc_normal_control_pages()
+	 * will allocate page in safe zone.
+	 * On the other hand, these pages are not in any segment, which means they are
+	 * left, not copied. Hence the radix tree laying out on them is not broken.
+	 */
+	if (kimage->head & IND_DONE)
+		alloc = crash_page_alloc;
+	else
+		alloc = kexec_page_alloc;
+	pgd_paddr = alloc(0, kimage);
+	pgd = (pgd_t *)phys_to_virt(pgd_paddr);
+	for (i = 0; i < kimage->nr_segments; i ++) {
+		seg = &kimage->segment[i];
+		paddr = ALIGN_DOWN(seg->mem, PAGE_SIZE);
+		sz = ALIGN(seg->mem - paddr + seg->memsz, PAGE_SIZE);
+		kexec_dprintk("Set up mapping for phyaddr: 0x%lx, size:0x%lx", paddr, sz);
+		//todo: distinguish executable segment
+		__create_pgd_mapping_locked(pgd, paddr, paddr, sz,
+				PAGE_KERNEL_EXEC, alloc, kimage, 0);
+	}
+
+	/*
+	 * UEFI stub can call EFI runtime service either before or after one-shot
+	 * SetVirtualAddressMap(). That means the mapping for
+	 * EFI_RUNTIME_SERVICES_CODE/_DATA should be set up here.
+	 * And the virtual address range occupied by md must be reserved,
+	 * accordingly, its physical address should not be allocated by kexec
+	 * allocator
+	 */
+	for_each_efi_memory_desc(md) {
+		if (md->attribute & EFI_MEMORY_RUNTIME) {
+			vaddr = md->virt_addr;
+			paddr = md->phys_addr;
+			sz = md->num_pages * EFI_PAGE_SIZE;
+			kexec_dprintk("Set up mapping for md phyaddr: 0x%lx, virt: 0x%lx, size:0x%lx", paddr, vaddr, sz);
+			__create_pgd_mapping_locked(pgd, paddr, vaddr, sz,
+					PAGE_KERNEL_EXEC, alloc, kimage, 0);
+		}
+	}
+
+	if (param->print_enabled)
+		__create_pgd_mapping_locked(pgd, param->earlycon_reg_base,
+				param->earlycon_reg_base, param->earlycon_reg_sz,
+				pgprot_device(PAGE_KERNEL), alloc, kimage, 0);
+
+	return pgd_paddr;
+}
+
 int machine_kexec_post_load(struct kimage *kimage)
 {
 	int rc;
@@ -109,7 +200,7 @@ int machine_kexec_post_load(struct kimage *kimage)
 	void *reloc_code = page_to_virt(kimage->control_code_page);
 	long reloc_size;
 	struct trans_pgd_info info = {
-		.trans_alloc_page	= kexec_page_alloc,
+		.trans_alloc_page	= __kexec_page_alloc,
 		.trans_alloc_arg	= kimage,
 	};
 
@@ -129,7 +220,7 @@ int machine_kexec_post_load(struct kimage *kimage)
 	}
 
 	/* Create a copy of the linear map */
-	trans_pgd = kexec_page_alloc(kimage);
+	trans_pgd = __kexec_page_alloc(kimage);
 	if (!trans_pgd)
 		return -ENOMEM;
 	rc = trans_pgd_create_copy(&info, &trans_pgd, PAGE_OFFSET, PAGE_END);
@@ -145,6 +236,7 @@ int machine_kexec_post_load(struct kimage *kimage)
 				  &kimage->arch.t0sz, reloc_code);
 	if (rc)
 		return rc;
+
 	kimage->arch.phys_offset = virt_to_phys(kimage) - (long)kimage;
 
 	/* Flush the reloc_code in preparation for its execution. */
@@ -175,7 +267,6 @@ void machine_kexec(struct kimage *kimage)
 		"Some CPUs may be stale, kdump will be unreliable.\n");
 
 	pr_info("Bye!\n");
-
 	local_daif_mask();
 
 	/*
@@ -192,6 +283,7 @@ void machine_kexec(struct kimage *kimage)
 
 		cpu_install_idmap();
 		restart = (void *)__pa_symbol(cpu_soft_restart);
+		/* kimage->start can be either the entry of kernel or efi emulator */
 		restart(is_hyp_nvhe(), kimage->start, kimage->arch.param_mem,
 			0, 0);
 	} else {
@@ -201,6 +293,7 @@ void machine_kexec(struct kimage *kimage)
 			__hyp_set_vectors(kimage->arch.el2_vectors);
 		cpu_install_ttbr0(kimage->arch.ttbr0, kimage->arch.t0sz);
 		kernel_reloc = (void *)kimage->arch.kern_reloc;
+		//tell between the emulator and normal kernel inside the relocate code 
 		kernel_reloc(kimage);
 	}
 

@@ -22,6 +22,7 @@
 
 #include <uapi/linux/kexec.h>
 #include <linux/verification.h>
+#include <linux/efi_emulator.h>
 
 extern note_buf_t __percpu *crash_notes;
 
@@ -464,7 +465,9 @@ static inline int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages, g
 static inline void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages) { }
 #endif
 
-extern phys_addr_t arch_emulator_prepare_pgtable(struct kimage *kimage);
+extern phys_addr_t arch_emulator_prepare_pgtable(struct kimage *kimage,
+		struct efi_emulator_param *param);
+
 extern bool kexec_file_dbg_print;
 
 #define kexec_dprintk(fmt, arg...) \
