@@ -13,6 +13,13 @@ extern void enable_sctlr_el1(unsigned long scratch_reg);
 static void arch_handle_mmu(struct efi_emulator_param *param)
 {
 	if (!param->mmu_on && param->pgd_root) {
+		unsigned long scratch_reg = 0;
+		// in fact, we need SYM_FUNC_START(__cpu_setup), later, set SCTLR_EL1
+		//  At present, the mmu is not ON
+		write_sysreg(param->pgd_root, ttbr0_el1);
+		isb();
+		/* scratch_reg asks the C compiler to save x0 */
+		enable_sctlr_el1(scratch_reg);
 	}
 }
 

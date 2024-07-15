@@ -65,7 +65,7 @@ emulator-y			:= head.o entry.o \
 				   core.o pe_loader.o memory.o memory_api.o config_table.o misc.o \
 				   device_handle.o protocol_simple_text_output.o protocol_device_path.o \
 				   lib.o printf.o \
-				   amba-pl011.o
+				   amba-pl011.o arm64_proc.o
 obj-y				:= efi_emulator.o
 
 
