@@ -506,6 +506,13 @@ union efi_simple_text_output_protocol {
 		efi_status_t (__efiapi *output_string)(efi_simple_text_output_protocol_t *,
 						       efi_char16_t *);
 		void *test_string;
+		void *query_mode;
+		void *set_mode;
+		void *set_attribute;
+		void *clean_screen;
+		void *set_cursor_pos;
+		void *enable_cursor;
+		void *mode;
 	};
 	struct {
 		u32 reset;
