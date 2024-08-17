@@ -44,7 +44,7 @@ SYM_CODE_START(arm64_relocate_new_kernel)
 	 */
 	ldr	x28, [x0, #KIMAGE_START]
 	ldr	x27, [x0, #KIMAGE_ARCH_EL2_VECTORS]
-	ldr	x26, [x0, #KIMAGE_ARCH_DTB_MEM]
+	ldr	x26, [x0, #KIMAGE_ARCH_PARAM_MEM]
 
 	/* Setup the list loop variables. */
 	ldr	x18, [x0, #KIMAGE_ARCH_ZERO_PAGE] /* x18 = zero page for BBM */

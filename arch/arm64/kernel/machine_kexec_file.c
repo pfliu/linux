@@ -184,6 +184,7 @@ int load_other_segments(struct kimage *image,
 		goto out_err;
 	image->arch.dtb = dtb;
 	image->arch.dtb_mem = kbuf.mem;
+	image->arch.param_mem = image->arch.dtb_mem;
 
 	kexec_dprintk("Loaded dtb at 0x%lx bufsz=0x%lx memsz=0x%lx\n",
 		      kbuf.mem, kbuf.bufsz, kbuf.memsz);

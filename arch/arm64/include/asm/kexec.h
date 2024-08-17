@@ -109,6 +109,7 @@ int machine_kexec_post_load(struct kimage *image);
 struct kimage_arch {
 	void *dtb;
 	phys_addr_t dtb_mem;
+	phys_addr_t param_mem;
 	phys_addr_t kern_reloc;
 	phys_addr_t el2_vectors;
 	phys_addr_t ttbr0;
