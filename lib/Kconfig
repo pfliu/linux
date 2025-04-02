@@ -165,6 +165,11 @@ config RANDOM32_SELFTEST
 #
 # compression support is select'ed if needed
 #
+config POST_DECOMPRESSOR
+	bool
+	help
+	  This option keeps the decompress routines after kernel initialization
+
 config 842_COMPRESS
 	select CRC32
 	tristate

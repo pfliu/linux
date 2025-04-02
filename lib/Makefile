@@ -175,6 +175,7 @@ lib-$(CONFIG_DECOMPRESS_XZ) += decompress_unxz.o
 lib-$(CONFIG_DECOMPRESS_LZO) += decompress_unlzo.o
 lib-$(CONFIG_DECOMPRESS_LZ4) += decompress_unlz4.o
 lib-$(CONFIG_DECOMPRESS_ZSTD) += decompress_unzstd.o
+lib-$(CONFIG_POST_DECOMPRESSOR) += post_decompress.o
 
 obj-$(CONFIG_TEXTSEARCH) += textsearch.o
 obj-$(CONFIG_TEXTSEARCH_KMP) += ts_kmp.o
