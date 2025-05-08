@@ -3568,4 +3568,26 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+struct mem_range_result {
+	struct kref ref;
+	struct rcu_head rcu;
+	char *buf;
+	uint32_t size;
+	/* kmalloc-ed or vmalloc-ed */
+	bool kmalloc;
+	int status;
+	struct mem_cgroup *memcg;
+};
+int mem_range_result_put(struct mem_range_result *result);
+
+typedef int (*resource_handler)(const char *name, struct mem_range_result *r);
+
+struct carrier_listener {
+	char *name;
+	bool kmalloc;
+	resource_handler handler;
+};
+
+int register_carrier_listener(struct carrier_listener *listener);
+int unregister_carrier_listener(char *str);
 #endif /* _LINUX_BPF_H */
