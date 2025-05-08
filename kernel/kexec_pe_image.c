@@ -15,6 +15,8 @@
 #include <linux/kexec.h>
 #include <linux/pe.h>
 #include <linux/string.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
 #include <asm/byteorder.h>
 #include <asm/cpufeature.h>
 #include <asm/image.h>
@@ -50,6 +52,43 @@ static struct parsed_phase *alloc_new_phase(void)
 
 	return phase;
 }
+
+/*
+ * @name should be one of : kernel, initrd, cmdline
+ */
+static int bpf_kexec_carrier(const char *name, struct mem_range_result *r)
+{
+	struct kexec_res *res;
+
+	if (!r || !name)
+		return -EINVAL;
+
+	res = kzalloc(sizeof(struct kexec_res), GFP_KERNEL);
+	if (!res)
+		return -ENOMEM;
+	res->name = kstrdup(name, GFP_KERNEL);
+	kref_get(&r->ref);
+	res->r= r;
+
+	INIT_LIST_HEAD(&res->node);
+	list_add_tail(&res->node, &cur_phase->res_head);
+	return 0;
+}
+
+static struct carrier_listener kexec_res_listener[3] = {
+	{ .name = "kernel",
+	  .kmalloc = false,
+	  .handler = bpf_kexec_carrier,
+	},
+	{ .name = "initrd",
+	  .kmalloc = false,
+	  .handler = bpf_kexec_carrier,
+	},
+	{ .name = "cmdline",
+	  .kmalloc = true,
+	  .handler = bpf_kexec_carrier,
+	},
+};
 
 static bool is_valid_pe(const char *kernel_buf, unsigned long kernel_len)
 {
@@ -210,6 +249,9 @@ static void *pe_image_load(struct kimage *image,
 	cmdline_start = cmdline;
 	cmdline_sz = cmdline_len;
 
+	for (int i = 0; i < ARRAY_SIZE(kexec_res_listener); i++)
+		register_carrier_listener(&kexec_res_listener[i]);
+
 	while(is_valid_format(linux_start, linux_sz) &&
 	      pe_has_bpf_section(linux_start, linux_sz)) {
 		struct kexec_context context;
@@ -248,6 +290,9 @@ static void *pe_image_load(struct kimage *image,
 		 */
 		disarm_bpf_prog();
 	}
+
+	for (int i = 0; i < ARRAY_SIZE(kexec_res_listener); i++)
+		unregister_carrier_listener(kexec_res_listener[i].name);
 
 	/* the rear of parsed phase contains the result */
 	list_for_each_entry_reverse(phase, &phase_head, head) {
