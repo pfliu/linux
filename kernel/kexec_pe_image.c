@@ -52,6 +52,54 @@ static struct parsed_phase *alloc_new_phase(void)
 	return phase;
 }
 
+/*
+ * @name should be one of : kernel, initrd, cmdline
+ */
+static int bpf_kexec_carrier(const char *name, struct mem_range_result *r)
+{
+	struct kexec_res *res;
+	char *t = NULL;
+
+	if (!r || !name)
+		return -EINVAL;
+
+	for (int i = 0; i < 3; i++) {
+		if (!strcmp(kexec_res_names[i], name)) {
+			t = kexec_res_names[i];
+			break;
+		}
+	}
+	if (!t)
+		return -EINVAL;
+
+	res = kzalloc(sizeof(struct kexec_res), GFP_KERNEL);
+	if (!res)
+		return -ENOMEM;
+	kref_get(&r->ref);
+	res->name = t;
+	res->r = r;
+
+	INIT_LIST_HEAD(&res->node);
+	list_add_tail(&res->node, &cur_phase->res_head);
+	return 0;
+}
+
+static struct carrier_listener kexec_res_listener[3] = {
+	{ .name = "kernel",
+	  .alloc_type = 1,
+	  .handler = bpf_kexec_carrier,
+	},
+	{ .name = "initrd",
+	  .alloc_type = 1,
+	  .handler = bpf_kexec_carrier,
+	},
+	{ .name = "cmdline",
+	  /* kmalloc-ed */
+	  .alloc_type = 0,
+	  .handler = bpf_kexec_carrier,
+	},
+};
+
 static bool is_valid_pe(const char *kernel_buf, unsigned long kernel_len)
 {
 	struct mz_hdr *mz;
@@ -169,6 +217,22 @@ __attribute__((used, optimize("O0"))) void bpf_post_handle_pefile(struct kexec_c
 	dummy += 2;
 }
 
+BTF_KFUNCS_START(kexec_modify_return_ids)
+BTF_ID_FLAGS(func, bpf_handle_pefile, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_post_handle_pefile, KF_SLEEPABLE)
+BTF_KFUNCS_END(kexec_modify_return_ids)
+
+static const struct btf_kfunc_id_set kexec_modify_return_set = {
+	.owner = THIS_MODULE,
+	.set = &kexec_modify_return_ids,
+};
+
+static int __init kexec_bpf_prog_run_init(void)
+{
+	return register_btf_fmodret_id_set(&kexec_modify_return_set);
+}
+late_initcall(kexec_bpf_prog_run_init);
+
 /*
  * PE file may be nested and should be unfold one by one.
  * Query 'kernel', 'initrd', 'cmdline' in cur_phase, as they are inputs for the
@@ -220,6 +284,9 @@ static void *pe_image_load(struct kimage *image,
 	cmdline_start = cmdline;
 	cmdline_sz = cmdline_len;
 
+	for (int i = 0; i < ARRAY_SIZE(kexec_res_listener); i++)
+		register_carrier_listener(&kexec_res_listener[i]);
+
 	while (is_valid_format(linux_start, linux_sz) &&
 	       pe_has_bpf_section(linux_start, linux_sz)) {
 		struct kexec_context context;
@@ -259,6 +326,9 @@ static void *pe_image_load(struct kimage *image,
 		 */
 		disarm_bpf_prog();
 	}
+
+	for (int i = 0; i < ARRAY_SIZE(kexec_res_listener); i++)
+		unregister_carrier_listener(kexec_res_listener[i].name);
 
 	/* the rear of parsed phase contains the result */
 	list_for_each_entry_reverse(phase, &phase_head, head) {
