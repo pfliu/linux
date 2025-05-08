@@ -24,6 +24,7 @@
 #include <linux/bpf_mem_alloc.h>
 #include <linux/kasan.h>
 #include <linux/bpf_verifier.h>
+#include <linux/decompress/generic.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -3278,12 +3279,192 @@ __bpf_kfunc void __bpf_trap(void)
 {
 }
 
+#define MAX_UNCOMPRESSED_BUF_SIZE	(1 << 28)
+/* a chunk should be large enough to contain a decompressing */
+#define CHUNK_SIZE	(1 << 23)
+
+/*
+ * At present, one global allocator for decompression. Later if needed, changing the
+ * prototype of decompress_fn to introduce each task's allocator.
+ */
+static DEFINE_MUTEX(output_buf_mutex);
+
+struct decompress_mem_allocator {
+	struct page **pages;
+	unsigned int pgidx;
+	void *chunk_start;
+	unsigned int chunk_size;
+	void *cur;
+};
+
+static struct decompress_mem_allocator dcmpr_allocator;
+
+static void *vmap_chunk(void)
+{
+	struct decompress_mem_allocator *a = &dcmpr_allocator;
+	unsigned int i, pg_cnt = a->chunk_size >> PAGE_SHIFT;
+	struct page **pg_start = &a->pages[a->pgidx];
+
+	for (i = 0; i < pg_cnt; i++)
+		a->pages[a->pgidx++] = alloc_page(GFP_KERNEL);
+
+	return vmap(pg_start, pg_cnt, VM_MAP, PAGE_KERNEL);
+}
+
+static int decompress_mem_allocator_init(struct decompress_mem_allocator *allocator, unsigned int chunk_size)
+{
+	unsigned long sz = (MAX_UNCOMPRESSED_BUF_SIZE >> PAGE_SHIFT) / sizeof(struct page *);
+
+	allocator->pages = __vmalloc(sz, GFP_KERNEL | __GFP_ACCOUNT);
+	if (!allocator->pages)
+		return -ENOMEM;
+
+	allocator->pgidx = 0;
+	allocator->chunk_start = NULL;
+	allocator->chunk_size = chunk_size;
+	allocator->cur = NULL;
+	return 0;
+}
+
+static void decompress_mem_allocator_fini(struct decompress_mem_allocator *allocator)
+{
+	unsigned int i;
+
+	for (i = 0; i < allocator->pgidx; i++)
+		__free_pages(allocator->pages[i], 0);
+	vfree(allocator->pages);
+}
+
+/*
+ * Copy the partial decompressed content in [buf, buf + len) to dst.
+ * If the dst size is beyond the capacity, return -1 to indicate the
+ * decompress method that something is wrong.
+ */
+static long flush(void *buf, unsigned long len)
+{
+	struct decompress_mem_allocator *a = &dcmpr_allocator;
+	unsigned long left;
+
+	left = a->chunk_start + a->chunk_size - a->cur;
+	if (left < len) {
+		if (a->pgidx > MAX_UNCOMPRESSED_BUF_SIZE >> PAGE_SHIFT)
+			return -1;
+		memcpy(a->cur, buf, left);
+		a->cur += left;
+		len -= left;
+		/* pages are not released */
+		vunmap(a->chunk_start);
+		a->chunk_start = a->cur = vmap_chunk();
+		if (unlikely(!a->chunk_start))
+			return -1;
+	}
+	memcpy(a->cur, buf, len);
+	a->cur += len;
+	return len + left;
+}
+
+__bpf_kfunc struct mem_range_result *bpf_decompress(char *image_gz_payload, int image_gz_sz)
+{
+	struct decompress_mem_allocator *a = &dcmpr_allocator;
+	decompress_fn decompressor;
+	struct mem_cgroup *memcg, *old_memcg;
+	struct mem_range_result *range;
+	const char *name;
+	char *input_buf;
+	int ret;
+
+	memcg = get_mem_cgroup_from_current();
+	old_memcg = set_active_memcg(memcg);
+	range = kmalloc(sizeof(struct mem_range_result), GFP_KERNEL);
+	if (!range) {
+		pr_err("fail to allocate mem_range_result\n");
+		goto error;
+	}
+	kref_init(&range->ref);
+
+	input_buf = __vmalloc(image_gz_sz, GFP_KERNEL | __GFP_ACCOUNT);
+	if (!input_buf) {
+		kfree(range);
+		pr_err("fail to allocate input buffer\n");
+		goto error;
+	}
+
+	ret = copy_from_kernel_nofault(input_buf, image_gz_payload, image_gz_sz);
+	if (ret < 0) {
+		kfree(range);
+		vfree(input_buf);
+		pr_err("Error when copying from 0x%p, size:0x%x\n",
+				image_gz_payload, image_gz_sz);
+		goto error;
+	}
+
+	mutex_lock(&output_buf_mutex);
+	decompress_mem_allocator_init(&dcmpr_allocator, CHUNK_SIZE);
+	decompressor = decompress_method(input_buf, image_gz_sz, &name);
+	if (!decompressor) {
+		kfree(range);
+		vfree(input_buf);
+		mutex_unlock(&output_buf_mutex);
+		pr_err("Can not find decompress method\n");
+		goto error;
+	}
+	ret = decompressor(input_buf, image_gz_sz, NULL, flush,
+				NULL, NULL, NULL);
+
+	vfree(input_buf);
+	/* Update the range map */
+	if (ret == 0) {
+		unsigned long pg_array_sz = a->pgidx * sizeof(struct page *);
+
+		range->pages = vmalloc(pg_array_sz);
+		if (!range->pages) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		range->pg_cnt = a->pgidx;
+		memcpy(range->pages, a->pages, pg_array_sz);
+		range->buf = vmap(range->pages, range->pg_cnt, VM_MAP, PAGE_KERNEL);
+		if (!range->buf) {
+			vfree(range->pages);
+			ret = -1;
+			goto fail;
+		}
+
+		/* vmap-ed */
+		range->alloc_type = 2;
+		range->buf_sz = a->pgidx << PAGE_SHIFT;
+		range->data_sz = range->buf_sz - a->chunk_size;
+		range->data_sz += a->cur - a->chunk_start;
+		mutex_unlock(&output_buf_mutex);
+		range->status = 0;
+		mem_cgroup_tryget(memcg);
+		range->memcg = memcg;
+		set_active_memcg(old_memcg);
+	}
+fail:
+	/* unmap the last chunk */
+	vunmap(a->chunk_start);
+	decompress_mem_allocator_fini(&dcmpr_allocator);
+	mutex_unlock(&output_buf_mutex);
+	if (!!ret) {
+		kfree(range);
+		range = NULL;
+		pr_err("Decompress error\n");
+	}
+
+error:
+	set_active_memcg(old_memcg);
+	mem_cgroup_put(memcg);
+	return range;
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(generic_btf_ids)
 #ifdef CONFIG_CRASH_DUMP
 BTF_ID_FLAGS(func, crash_kexec, KF_DESTRUCTIVE)
 #endif
+BTF_ID_FLAGS(func, bpf_decompress, KF_TRUSTED_ARGS | KF_ACQUIRE | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_mem_range_result_put, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_copy_to_kernel, KF_TRUSTED_ARGS | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_obj_new_impl, KF_ACQUIRE | KF_RET_NULL)
