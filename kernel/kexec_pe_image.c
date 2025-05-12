@@ -25,6 +25,9 @@
 
 #include "kexec_bpf/kexec_pe_parser_bpf.lskel.h"
 
+void bpf_handle_pefile(struct kexec_context *context);
+void bpf_post_handle_pefile(void);
+
 static LIST_HEAD(phase_head);
 
 struct parsed_phase {
