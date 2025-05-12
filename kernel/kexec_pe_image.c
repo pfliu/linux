@@ -449,7 +449,7 @@ err:
 				res->r->buf = NULL;
 				res->r->size = 0;
 			}
-			bpf_mem_range_result_put(res->r);
+			mem_range_result_put(res->r);
 			kfree(res);
 		}
 		list_del(&phase->head);
