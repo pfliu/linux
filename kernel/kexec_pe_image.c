@@ -357,7 +357,7 @@ static void *pe_image_load(struct kimage *image,
 		prepare_nested_pe(&linux_start, &linux_sz, &initrd_start,
 					&initrd_sz, &cmdline_start);
 		/* bpf-prog fentry */
-		bpf_post_handle_pefile();
+		bpf_post_handle_pefile(&context);
 		/*
 		 * detach the current bpf-prog from their attachment points.
 		 * It also a point to free any registered interim resource.
