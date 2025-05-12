@@ -25,9 +25,6 @@
 
 #include "kexec_bpf/kexec_pe_parser_bpf.lskel.h"
 
-void bpf_handle_pefile(struct kexec_context *context);
-void bpf_post_handle_pefile(void);
-
 static LIST_HEAD(phase_head);
 
 struct parsed_phase {
@@ -258,6 +255,10 @@ struct kexec_context {
 	int cmdline_sz;
 };
 
+void bpf_handle_pefile(struct kexec_context *context);
+void bpf_post_handle_pefile(struct kexec_context *context);
+
+
 /*
  * In eBPF, functions can only pass up to five arguments through R1 to R5.
  * If five arguments are not enough, considering parse_zboot(struct pt_regs *regs)
@@ -268,7 +269,7 @@ __attribute__((used, optimize("O0"))) void bpf_handle_pefile(struct kexec_contex
 {
 }
 
-__attribute__((used, optimize("O0"))) void bpf_post_handle_pefile(void)
+__attribute__((used, optimize("O0"))) void bpf_post_handle_pefile(struct kexec_context *context)
 {
 }
 
