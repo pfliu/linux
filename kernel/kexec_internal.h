@@ -41,6 +41,7 @@ extern int pe_get_section(const char *file_buf, unsigned long buf_sz,
 		const char *sect_name, char **sect_start,
 		unsigned long *sect_sz);
 extern int decompose_kexec_image(struct kimage *image, int extended_fd);
+extern const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, const char *name);
 #else /* CONFIG_KEXEC_FILE */
 static inline void kimage_file_post_load_cleanup(struct kimage *image) { }
 #endif /* CONFIG_KEXEC_FILE */
