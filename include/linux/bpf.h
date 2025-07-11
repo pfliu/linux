@@ -3588,6 +3588,12 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 	return prog->aux->func_idx != 0;
 }
 
+enum alloc_type {
+	TYPE_KALLOC,
+	TYPE_VMALLOC,
+	TYPE_VMAP,
+};
+
 struct mem_range_result {
 	struct kref ref;
 	struct rcu_head rcu;
@@ -3595,7 +3601,7 @@ struct mem_range_result {
 	uint32_t buf_sz;
 	uint32_t data_sz;
 	/* kmalloc-ed, vmalloc-ed, or vmap-ed */
-	unsigned char alloc_type;
+	enum alloc_type alloc_type;
 	/* Valid if vmap-ed */
 	struct page **pages;
 	unsigned int pg_cnt;

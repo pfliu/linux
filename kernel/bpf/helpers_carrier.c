@@ -19,7 +19,7 @@ struct str_listener {
 	 * bpf_copy_to_kernel() knows the size in advance, so vmap-ed is not
 	 * supported.
 	 */
-	unsigned char alloc_type;
+	enum alloc_type alloc_type;
 };
 
 DEFINE_STATIC_SRCU(srcu);
@@ -38,22 +38,24 @@ static struct str_listener *find_listener(const char *str)
 	return NULL;
 }
 
-static void __mem_range_result_free(struct rcu_head *rcu)
+static void __mem_range_result_free(struct kref *kref)
 {
-	struct mem_range_result *result = container_of(rcu, struct mem_range_result, rcu);
+	struct mem_range_result *result = container_of(kref, struct mem_range_result, ref);
 	struct mem_cgroup *memcg, *old_memcg;
 
+	/* vunmap() is blocking */
+	might_sleep();
 	memcg = result->memcg;
 	old_memcg = set_active_memcg(memcg);
 	if (likely(!!result->buf)) {
 		switch (result->alloc_type) {
-		case 0:
+		case TYPE_KALLOC:
 			kfree(result->buf);
 			break;
-		case 1:
+		case TYPE_VMALLOC:
 			vfree(result->buf);
 			break;
-		case 2:
+		case TYPE_VMAP:
 			vunmap(result->buf);
 			for (unsigned int i = 0; i < result->pg_cnt; i++)
 				__free_pages(result->pages[i], 0);
@@ -65,22 +67,15 @@ static void __mem_range_result_free(struct rcu_head *rcu)
 	mem_cgroup_put(memcg);
 }
 
-static void __mem_range_result_put(struct kref *kref)
-{
-	struct mem_range_result *result = container_of(kref, struct mem_range_result, ref);
-
-	call_srcu(&srcu, &result->rcu, __mem_range_result_free);
-}
-
 int mem_range_result_put(struct mem_range_result *result)
 {
-
+	might_sleep();
 	if (!result) {
 		pr_err("%s, receive invalid range\n", __func__);
 		return -EINVAL;
 	}
 
-	kref_put(&result->ref, __mem_range_result_put);
+	kref_put(&result->ref, __mem_range_result_free);
 	return 0;
 }
 
@@ -98,7 +93,7 @@ __bpf_kfunc int bpf_copy_to_kernel(const char *name, char *buf, int size)
 	struct mem_cgroup *memcg, *old_memcg;
 	struct str_listener *item;
 	resource_handler handler;
-	unsigned char alloc_type;
+	enum alloc_type alloc_type;
 	char *kbuf;
 	int id, ret = 0;
 
@@ -122,10 +117,10 @@ __bpf_kfunc int bpf_copy_to_kernel(const char *name, char *buf, int size)
 
 	kref_init(&range->ref);
 	switch (alloc_type) {
-	case 0:
+	case TYPE_KALLOC:
 		kbuf = kmalloc(size, GFP_KERNEL | __GFP_ACCOUNT);
 		break;
-	case 1:
+	case TYPE_VMALLOC:
 		kbuf = __vmalloc(size, GFP_KERNEL | __GFP_ACCOUNT);
 		break;
 	}
@@ -137,7 +132,7 @@ __bpf_kfunc int bpf_copy_to_kernel(const char *name, char *buf, int size)
 	ret = copy_from_kernel_nofault(kbuf, buf, size);
 	if (unlikely(ret < 0)) {
 		kfree(range);
-		if (range->alloc_type == 0)
+		if (range->alloc_type == TYPE_KALLOC)
 			kfree(kbuf);
 		else
 			vfree(kbuf);
@@ -166,7 +161,7 @@ int register_carrier_listener(struct carrier_listener *listener)
 	int ret = 0;
 
 	/* Not support vmap-ed */
-	if (listener->alloc_type > 1)
+	if (listener->alloc_type > TYPE_VMALLOC)
 		return -EINVAL;
 	if (!listener->name)
 		return -EINVAL;
