@@ -36,6 +36,11 @@ void set_kexec_sig_enforced(void)
 {
 	sig_enforce = true;
 }
+
+bool get_kexec_sig_enforced(void)
+{
+	return sig_enforce;
+}
 #endif
 
 #ifdef CONFIG_IMA_KEXEC
@@ -221,6 +226,7 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 {
 	ssize_t ret;
 	void *ldata;
+	bool envelop = false;
 
 	ret = kernel_read_file_from_fd(kernel_fd, 0, &image->kernel_buf,
 				       KEXEC_FILE_SIZE_MAX, NULL,
@@ -231,17 +237,31 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 	kexec_dprintk("kernel: %p kernel_size: %#lx\n",
 		      image->kernel_buf, image->kernel_buf_len);
 
-	/* Call arch image probe handlers */
+	if (IS_ENABLED(CONFIG_KEXEC_BPF)) {
+		ret = decompose_kexec_image(image, initrd_fd);
+		/* With .bpf section, but failed */
+		if (ret != -EINVAL)
+			goto out;
+
+		envelop = true;
+	}
+
+	/*
+	 * From this point, the kexec subsystem handle the kernel boot protocol.
+	 *
+	 * Call arch image probe handlers
+	 */
 	ret = arch_kexec_kernel_image_probe(image, image->kernel_buf,
 					    image->kernel_buf_len);
 	if (ret)
 		goto out;
 
 #ifdef CONFIG_KEXEC_SIG
-	ret = kimage_validate_signature(image);
-
-	if (ret)
-		goto out;
+	if (!envelop) {
+		ret = kimage_validate_signature(image);
+		if (ret)
+			goto out;
+	}
 #endif
 	/* It is possible that there no initramfs is being loaded */
 	if (!(flags & KEXEC_FILE_NO_INITRAMFS)) {
