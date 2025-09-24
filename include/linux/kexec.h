@@ -23,6 +23,10 @@
 #include <uapi/linux/kexec.h>
 #include <linux/verification.h>
 
+#if defined(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY) || defined(CONFIG_KEXEC_PE_IMAGE)
+#include <linux/module.h>
+#endif
+
 extern note_buf_t __percpu *crash_notes;
 
 #ifdef CONFIG_CRASH_DUMP
@@ -158,6 +162,7 @@ extern const struct kexec_file_ops * const kexec_file_loaders[];
 
 int kexec_image_probe_default(struct kimage *image, void *buf,
 			      unsigned long buf_len);
+void *kexec_image_load_default(struct kimage *image);
 int kexec_image_post_load_cleanup_default(struct kimage *image);
 
 /*
@@ -443,6 +448,7 @@ static inline int machine_kexec_post_load(struct kimage *image) { return 0; }
 
 extern struct kimage *kexec_image;
 extern struct kimage *kexec_crash_image;
+extern const struct kexec_file_ops pe_image_ops;
 
 bool kexec_load_permitted(int kexec_image_type);
 
@@ -547,6 +553,10 @@ static inline void kimage_unmap_segment(void *buffer) { }
 void set_kexec_sig_enforced(void);
 #else
 static inline void set_kexec_sig_enforced(void) {}
+#endif
+
+#if defined(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY) || defined(CONFIG_KEXEC_PE_IMAGE)
+const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, const char *name);
 #endif
 
 #endif /* !defined(__ASSEBMLY__) */
