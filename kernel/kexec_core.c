@@ -1190,6 +1190,12 @@ int kernel_kexec(void)
 		cpu_hotplug_disable();
 		kexec_in_progress = true;
 		cpu_hotplug_enable();
+		/*
+		 * As CPU hot-removal, the crowed deadline task may starve other
+		 * tasks. So stop all of the user space tasks.
+		 */
+		mutex_lock(&system_transition_mutex);
+		try_to_freeze_tasks(true);
 		kernel_restart_prepare("kexec reboot");
 		migrate_to_reboot_cpu();
 		syscore_shutdown();
