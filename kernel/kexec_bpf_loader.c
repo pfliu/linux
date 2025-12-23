@@ -19,6 +19,7 @@
 #include <linux/bpf.h>
 #include <linux/filter.h>
 #include <asm/byteorder.h>
+#include <linux/decompress/generic.h>
 #include "kexec_internal.h"
 
 /* Load a ELF */
@@ -71,6 +72,35 @@ static int __init kexec_bpf_prog_run_init(void)
 }
 late_initcall(kexec_bpf_prog_run_init);
 
+/* Mark the bpf parser success */
+#define KEXEC_BPF_CMD_INVALID		0x0
+#define KEXEC_BPF_CMD_DONE		0x1
+#define KEXEC_BPF_CMD_DECOMPRESS	0x2
+
+#define KEXEC_BPF_SUBCMD_INVALID	0x0
+#define KEXEC_BPF_SUBCMD_KERNEL		0x1
+#define KEXEC_BPF_SUBCMD_INITRD		0x2
+#define KEXEC_BPF_SUBCMD_CMDLINE	0x3
+
+#define KEXEC_BPF_PIPELINE_INVALID	0x0
+#define KEXEC_BPF_PIPELINE_FILL		0x1
+
+struct cmd_hdr {
+	uint16_t cmd;
+	uint8_t subcmd;
+	uint8_t pipeline_flag;
+	/* sizeof(chunks) + sizeof(all data) */
+	uint32_t payload_len;
+	/* 0 */
+	uint16_t num_chunks;
+} __packed;
+
+/* Reserved for extension */
+struct cmd_chunk {
+	uint16_t type;
+	uint32_t len;
+} __packed;
+
 /*
  * This function is only called from BPF programs hooked at
  * kexec_image_parser_anchor(). Therefore, it is only invoked in the
@@ -78,7 +108,53 @@ late_initcall(kexec_bpf_prog_run_init);
  */
 static int kexec_buff_parser(struct bpf_parser_context *parser)
 {
-	return 0;
+	struct bpf_parser_buf *pbuf = parser->buf;
+	struct kexec_context *ctx = (struct kexec_context *)parser->data;
+	struct cmd_hdr *cmd;
+	char *decompressed_buf, *buf, *p;
+	unsigned long decompressed_sz;
+	int ret = -EINVAL;
+
+	if (pbuf->size < sizeof(struct cmd_hdr))
+		return -EINVAL;
+
+	cmd = (struct cmd_hdr *)pbuf->buf;
+	if (cmd->payload_len > pbuf->size - sizeof(struct cmd_hdr))
+		return -EINVAL;
+
+	buf = pbuf->buf + sizeof(struct cmd_hdr);
+	if (cmd->payload_len + sizeof(struct cmd_hdr) > pbuf->size) {
+		pr_info("Invalid payload size:0x%x, while buffer size:0x%x\n",
+				cmd->payload_len, pbuf->size);
+		return -EINVAL;
+	}
+	switch (cmd->cmd) {
+	case KEXEC_BPF_CMD_DONE:
+		ctx->parsed = true;
+		break;
+	case KEXEC_BPF_CMD_DECOMPRESS:
+		ret = post_boot_decompress(buf, cmd->payload_len, &decompressed_buf,
+					&decompressed_sz);
+		if (!ret) {
+			switch (cmd->subcmd) {
+			case KEXEC_BPF_SUBCMD_KERNEL:
+				vfree(ctx->kernel);
+				ctx->kernel = decompressed_buf;
+				ctx->kernel_sz = decompressed_sz;
+				break;
+			default:
+				vfree(decompressed_buf);
+				ret = -EINVAL;
+				break;
+			}
+		}
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
 }
 
 #define KEXEC_ELF_BPF_PREFIX		".bpf."
