@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
+// Copyright (C) 2025, 2026 Red Hat, Inc
+//
 #include "vmlinux.h"
 #include <bpf_helpers.h>
 #include <bpf_tracing.h>
@@ -14,46 +16,7 @@
 #define RINGBUF4_SIZE MIN_BUF_SIZE
 
 
-/* ringbuf is safe since the user space has no write access to them */
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, RINGBUF1_SIZE);
-} ringbuf_1 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, RINGBUF2_SIZE);
-} ringbuf_2 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, RINGBUF3_SIZE);
-} ringbuf_3 SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, RINGBUF4_SIZE);
-} ringbuf_4 SEC(".maps");
-
-char LICENSE[] SEC("license") = "GPL";
-
-/*
- * This function ensures that the sections .rodata, .data, .rodata.str1.1 and .bss
- * are created for a bpf prog.
- */
-static const char dummy_rodata[16] __attribute__((used)) = "rodata";
-static char dummy_data[16] __attribute__((used)) = "data";
-static char *dummy_mergeable_str  __attribute__((used)) = ".rodata.str1.1";
-static char dummy_bss[16] __attribute__((used));
-
-
-#define KEXEC_BPF_CMD_DECOMPRESS       0x1
-#define KEXEC_BPF_CMD_COPY             0x2
-
-#define KEXEC_BPF_SUBCMD_KERNEL                0x1
-#define KEXEC_BPF_SUBCMD_INITRD                0x2
-#define KEXEC_BPF_SUBCMD_CMDLINE       0x3
-
+#include "template.c"
 
 /* see drivers/firmware/efi/libstub/zboot-header.S */
 struct linux_pe_zboot_header {
