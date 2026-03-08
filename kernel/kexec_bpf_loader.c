@@ -14,7 +14,11 @@
 #include <linux/vmalloc.h>
 #include <linux/kexec.h>
 #include <linux/ima.h>
+#include <linux/integrity.h>
+#include <crypto/hash.h>
+#include <crypto/hash_info.h>
 #include <linux/elf.h>
+#include <linux/pe.h>
 #include <linux/string.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
@@ -207,6 +211,169 @@ struct cmd_chunk {
 } __packed;
 
 /*
+ * verify_pe_sig - verify the Authenticode signature of a PE/COFF image
+ * @payload: pointer to PE data
+ * @pay_len: length of PE data
+ *
+ * Verification is attempted against secondary trusted keyring, then
+ * platform keyring.
+ *
+ * Returns 0 on success, negative errno otherwise.
+ */
+static int verify_pe_sig(const char *payload, u32 pay_len)
+{
+	int ret;
+
+	ret = verify_pefile_signature(payload, pay_len,
+				      VERIFY_USE_SECONDARY_KEYRING,
+				      VERIFYING_KEXEC_PE_SIGNATURE);
+	if (ret) {
+		pr_debug(
+			"kexec verify_sig_pe: secondary keyring failed (%d), trying platform\n",
+			ret);
+		ret = verify_pefile_signature(payload, pay_len,
+					      VERIFY_USE_PLATFORM_KEYRING,
+					      VERIFYING_KEXEC_PE_SIGNATURE);
+	}
+
+	if (ret) {
+		if (get_kexec_sig_enforced())
+			pr_err("kexec verify_sig_pe: signature verification failed: %d\n",
+			       ret);
+		else
+			ret = 0;
+	}
+
+	return ret;
+}
+
+/*
+ * verify_elf_sig - verify PKCS#7 signature appended to a signed ELF
+ * @payload: pointer to ELF data
+ * @pay_len: length of ELF data including appended signature trailer
+ *
+ * The appended signature format is produced by scripts/sign-file:
+ *
+ *   [ ELF data ][ PKCS#7 ][ struct module_signature ][ MODULE_SIG_STRING ]
+ *
+ * Verification is attempted against secondary trusted keyring, then
+ * platform keyring.
+ *
+ * Returns 0 on success, negative errno otherwise.
+ */
+static int verify_elf_sig(const char *payload, u32 pay_len)
+{
+	const struct module_signature *ms;
+	size_t sig_len, data_len = pay_len;
+	int ret;
+
+	if (pay_len <= sizeof(MODULE_SIG_STRING) - 1 + sizeof(*ms))
+		goto no_sig;
+
+	data_len -= sizeof(MODULE_SIG_STRING) - 1;
+	if (memcmp(payload + data_len, MODULE_SIG_STRING,
+		   sizeof(MODULE_SIG_STRING) - 1) != 0)
+		goto no_sig;
+
+	data_len -= sizeof(*ms);
+	ms = (const struct module_signature *)(payload + data_len);
+
+	sig_len = be32_to_cpu(ms->sig_len);
+	if (sig_len == 0 || sig_len > data_len) {
+		pr_err("kexec verify_sig_elf: malformed signature trailer\n");
+		return -EBADMSG;
+	}
+
+	data_len -= sig_len;
+
+	ret = verify_pkcs7_signature(payload, data_len, payload + data_len,
+				     sig_len, VERIFY_USE_SECONDARY_KEYRING,
+				     VERIFYING_MODULE_SIGNATURE, NULL, NULL);
+	if (ret) {
+		pr_debug(
+			"kexec verify_sig_elf: secondary keyring failed (%d), trying platform\n",
+			ret);
+		ret = verify_pkcs7_signature(payload, data_len,
+					     payload + data_len, sig_len,
+					     VERIFY_USE_PLATFORM_KEYRING,
+					     VERIFYING_MODULE_SIGNATURE, NULL,
+					     NULL);
+	}
+
+	if (ret)
+		pr_err("kexec verify_sig_elf: signature verification failed: %d\n",
+		       ret);
+	return ret;
+
+no_sig:
+	if (get_kexec_sig_enforced()) {
+		pr_err("kexec verify_sig_elf: missing signature and sig_enforce is set\n");
+		return -EKEYREJECTED;
+	}
+	return 0;
+}
+
+static bool is_elf64_image(const char *buf, size_t sz)
+{
+	if (sz < EI_CLASS + 1)
+		return false;
+	if (memcmp(buf, ELFMAG, SELFMAG) != 0)
+		return false;
+	return buf[EI_CLASS] == ELFCLASS64;
+}
+
+/*
+ * The UEFI Terse Executable (TE) image has MZ header.
+ */
+static bool is_pe_image(const char *buf, size_t sz)
+{
+	struct mz_hdr *mz;
+	struct pe_hdr *pe;
+
+	if (!buf)
+		return false;
+	mz = (struct mz_hdr *)buf;
+	if (mz->magic != IMAGE_DOS_SIGNATURE)
+		return false;
+	if (sz < mz->peaddr + sizeof(struct pe_hdr))
+		return false;
+	pe = (struct pe_hdr *)(buf + mz->peaddr);
+	if (pe->magic != IMAGE_NT_SIGNATURE)
+		return false;
+	if (pe->opt_hdr_size == 0) {
+		pr_err("optional header is missing\n");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * verify_file_sig - verify the embedded signature of a PE or ELF payload
+ * @buf:    start of the kexec parser buffer (cmd_hdr + chunks + data)
+ * @buf_sz: total size of the buffer
+ *
+ * Expects either a PE/COFF image (MZ magic) or a signed ELF image (ELF magic +
+ * appended PKCS#7 trailer as produced by scripts/sign-file).
+ *
+ * For both formats, verification is attempted against the secondary
+ * trusted keyring first (covers builtin + secondary trusted keys), then
+ * against the platform keyring (covers UEFI db keys).
+ *
+ * Returns 0 on success, negative errno otherwise.
+ */
+static int verify_file_sig(const char *buf, size_t buf_sz)
+{
+	if (is_pe_image(buf, buf_sz))
+		return verify_pe_sig(buf, buf_sz);
+
+	if (is_elf64_image(buf, buf_sz))
+		return verify_elf_sig(buf, buf_sz);
+
+	pr_err("kexec verify_sig: unrecognized file format\n");
+	return -EINVAL;
+}
+
+/*
  * This function is only called from BPF programs hooked at
  * kexec_image_parser_anchor(). Therefore, it is only invoked in the
  * kexec_file_load path, which is not reentrant.
@@ -367,6 +534,9 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 			break;
 		}
 		break;
+	case KEXEC_BPF_CMD_VERIFY_SIG:
+		ret = verify_file_sig(buf, cmd->payload_len);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -379,15 +549,6 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 #define KEXEC_ELF_BPF_NESTED		".bpf.nested"
 #define KEXEC_ELF_BPF_MAX_IDX		8
 #define KEXEC_ELF_BPF_MAX_DEPTH		4
-
-static bool is_elf64_image(const char *buf, size_t sz)
-{
-	if (sz < EI_CLASS + 1)
-		return false;
-	if (memcmp(buf, ELFMAG, SELFMAG) != 0)
-		return false;
-	return buf[EI_CLASS] == ELFCLASS64;
-}
 
 /*
  * elf_get_shstrtab - resolve the section-name string table of an ELF image
@@ -439,72 +600,6 @@ static int elf_get_shstrtab(const char *buf, size_t sz,
 	*shdrs_out    = shdrs;
 	*shstrtab_out = buf + shstr_shdr->sh_offset;
 
-	return 0;
-}
-
-/*
- * verify_elf_sig - verify PKCS#7 signature appended to a signed ELF
- * @payload: pointer to ELF data
- * @pay_len: length of ELF data including appended signature trailer
- *
- * The appended signature format is produced by scripts/sign-file:
- *
- *   [ ELF data ][ PKCS#7 ][ struct module_signature ][ MODULE_SIG_STRING ]
- *
- * Verification is attempted against secondary trusted keyring, then
- * platform keyring.
- *
- * Returns 0 on success, negative errno otherwise.
- */
-static int verify_elf_sig(const char *payload, u32 pay_len)
-{
-	const struct module_signature *ms;
-	size_t sig_len, data_len = pay_len;
-	int ret;
-
-	if (pay_len <= sizeof(MODULE_SIG_STRING) - 1 + sizeof(*ms))
-		goto no_sig;
-
-	data_len -= sizeof(MODULE_SIG_STRING) - 1;
-	if (memcmp(payload + data_len, MODULE_SIG_STRING,
-		   sizeof(MODULE_SIG_STRING) - 1) != 0)
-		goto no_sig;
-
-	data_len -= sizeof(*ms);
-	ms = (const struct module_signature *)(payload + data_len);
-
-	sig_len = be32_to_cpu(ms->sig_len);
-	if (sig_len == 0 || sig_len > data_len) {
-		pr_err("kexec verify_sig_elf: malformed signature trailer\n");
-		return -EBADMSG;
-	}
-
-	data_len -= sig_len;
-
-	ret = verify_pkcs7_signature(payload, data_len, payload + data_len,
-				     sig_len, VERIFY_USE_SECONDARY_KEYRING,
-				     VERIFYING_MODULE_SIGNATURE, NULL, NULL);
-	if (ret) {
-		pr_debug(
-			"kexec verify_sig_elf: secondary keyring failed (%d), trying platform\n",
-			ret);
-		ret = verify_pkcs7_signature(payload, data_len,
-					     payload + data_len, sig_len,
-					     VERIFY_USE_PLATFORM_KEYRING,
-					     VERIFYING_MODULE_SIGNATURE, NULL,
-					     NULL);
-	}
-
-	if (ret)
-		pr_err("kexec verify_sig_elf: signature verification failed: %d\n",
-		       ret);
-	return ret;
-
-no_sig:
-	if (get_kexec_sig_enforced()) {
-		pr_err("kexec verify_sig_elf: missing signature and sig_enforce is set\n");
-		return -EKEYREJECTED;
-	}
 	return 0;
 }
 
