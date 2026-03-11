@@ -39,6 +39,8 @@ struct kexec_context {
 	bool parsed;
 	char *parsing_buf[MAX_PARSING_BUF_NUM];
 	unsigned long parsing_buf_sz[MAX_PARSING_BUF_NUM];
+	char *next_parsing_buf[MAX_PARSING_BUF_NUM];
+	unsigned long next_parsing_buf_sz[MAX_PARSING_BUF_NUM];
 
 	char *kernel;
 	unsigned long kernel_sz;
@@ -112,9 +114,10 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 	struct bpf_parser_buf *pbuf = parser->buf;
 	struct kexec_context *ctx = (struct kexec_context *)parser->data;
 	struct cmd_hdr *cmd;
-	char *decompressed_buf, *buf, *p;
+	char *decompressed_buf, *buf, *p, *pn;
 	unsigned long decompressed_sz;
-	int ret = -EINVAL;
+	bool fill_pipeline = false;
+	int i, ret = -EINVAL;
 
 	if (pbuf->size < sizeof(struct cmd_hdr))
 		return -EINVAL;
@@ -129,6 +132,7 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 				cmd->payload_len, pbuf->size);
 		return -EINVAL;
 	}
+	fill_pipeline = cmd->pipeline_flag & KEXEC_BPF_PIPELINE_FILL;
 	switch (cmd->cmd) {
 	case KEXEC_BPF_CMD_DONE:
 		ctx->parsed = true;
@@ -139,9 +143,39 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 		if (!ret) {
 			switch (cmd->subcmd) {
 			case KEXEC_BPF_SUBCMD_KERNEL:
+				/*
+				 * The image may consist of multiple layers. An outer parser cannot
+				 * determine whether the parsed result is terminal, so it forwards
+				 * the result to the next layer.
+				 *
+				 * A parser may skip KEXEC_BPF_PIPELINE_FILL based on the image
+				 * format specification.
+				 */
+				if (fill_pipeline) {
+					for (i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+						if (!ctx->next_parsing_buf[i])
+							break;
+					}
+					/* No enough parsing slot */
+					if (i == MAX_PARSING_BUF_NUM) {
+						vfree(decompressed_buf);
+						return -ENOMEM;
+					}
+					p = __vmalloc(decompressed_sz, GFP_KERNEL | __GFP_ACCOUNT);
+					if (!p) {
+						vfree(decompressed_buf);
+						return -ENOMEM;
+					}
+				}
+
 				vfree(ctx->kernel);
 				ctx->kernel = decompressed_buf;
 				ctx->kernel_sz = decompressed_sz;
+				if (fill_pipeline) {
+					memcpy(p, decompressed_buf, decompressed_sz);
+					ctx->next_parsing_buf[i] = p;
+					ctx->next_parsing_buf_sz[i] = decompressed_sz;
+				}
 				break;
 			default:
 				vfree(decompressed_buf);
@@ -171,6 +205,26 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 		if (!p)
 			return -ENOMEM;
 		memcpy(p, buf, cmd->payload_len);
+		if (fill_pipeline) {
+			for (i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+				if (!ctx->next_parsing_buf[i])
+					break;
+			}
+			/* No enough parsing slot */
+			if (i == MAX_PARSING_BUF_NUM) {
+				vfree(p);
+				return -ENOMEM;
+			}
+			pn = __vmalloc(cmd->payload_len, GFP_KERNEL | __GFP_ACCOUNT);
+			if (!pn) {
+				vfree(p);
+				return -ENOMEM;
+			}
+			memcpy(pn, buf, cmd->payload_len);
+			ctx->next_parsing_buf[i] = pn;
+			ctx->next_parsing_buf_sz[i] = cmd->payload_len;
+		}
+
 		switch (cmd->subcmd) {
 		case KEXEC_BPF_SUBCMD_KERNEL:
 			vfree(ctx->kernel);
@@ -516,8 +570,34 @@ static int process_bpf_parsers_container(const char *elf_buf, size_t elf_sz,
 		 */
 		put_bpf_parser_context(bpf);
 		/* If the bpf-prog success, it flags by KEXEC_BPF_CMD_DONE */
-		if (context->parsed)
+		if (context->parsed) {
 			found = true;
+			/* Free the old parsing context, and reload the new */
+			for (int i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+				if (!context->parsing_buf[i])
+					break;
+				vfree(context->parsing_buf[i]);
+				context->parsing_buf[i] = NULL;
+				context->parsing_buf_sz[i] = 0;
+			}
+			for (int i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+				if (!context->next_parsing_buf[i])
+					break;
+				context->parsing_buf[i] = context->next_parsing_buf[i];
+				context->parsing_buf_sz[i] = context->next_parsing_buf_sz[i];
+				context->next_parsing_buf[i] = NULL;
+				context->next_parsing_buf_sz[i] = 0;
+			}
+		} else {
+			/* Discard broken parsed result, then try next parser */
+			for (int i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+				if (!context->next_parsing_buf[i])
+					break;
+				vfree(context->next_parsing_buf[i]);
+				context->next_parsing_buf[i] = NULL;
+				context->next_parsing_buf_sz[i] = 0;
+			}
+		}
 	}
 
 	if (!found) {
@@ -585,6 +665,12 @@ int decompose_kexec_image(struct kimage *image, int extended_fd)
 				break;
 			vfree(context->parsing_buf[i]);
 			context->parsing_buf[i] = NULL;
+		}
+		for (int i = 0; i < MAX_PARSING_BUF_NUM; i++) {
+			if (!context->next_parsing_buf[i])
+				break;
+			vfree(context->next_parsing_buf[i]);
+			context->next_parsing_buf[i] = NULL;
 		}
 
 		if (!ret) {
