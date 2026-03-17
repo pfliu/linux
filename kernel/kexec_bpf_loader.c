@@ -90,6 +90,46 @@ static void *get_symbol_from_elf(const char *elf_data, size_t elf_size,
 	return symbol_data;
 }
 
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+
+static int write_buffer_to_disk(char *bpf_elf, unsigned long sz, const char *path)
+{
+    struct file *filp;
+    loff_t pos = 0;
+    ssize_t written;
+    int ret = 0;
+
+    /* 1. 打开（或创建）文件 */
+    filp = filp_open(path,
+                     O_WRONLY | O_CREAT | O_TRUNC,
+                     0644);
+    if (IS_ERR(filp)) {
+        pr_err("filp_open failed: %ld\n", PTR_ERR(filp));
+        return PTR_ERR(filp);
+    }
+
+    /* 2. 写入内存到磁盘 */
+    written = kernel_write(filp, bpf_elf, sz, &pos);
+    if (written < 0) {
+        pr_err("kernel_write failed: %zd\n", written);
+        ret = written;
+        goto out;
+    }
+    if (written != sz) {
+        pr_err("short write: %zd of %lu bytes\n", written, sz);
+        ret = -EIO;
+        goto out;
+    }
+
+    pr_info("wrote %zd bytes to %s\n", written, path);
+
+out:
+    /* 3. 关闭文件 */
+    filp_close(filp, NULL);
+    return ret;
+}
+
 /* Load a ELF */
 static int arm_bpf_prog(char *bpf_elf, unsigned long sz)
 {
@@ -492,6 +532,7 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 			memcpy(pn, buf, cmd->payload_len);
 			ctx->next_parsing_buf[i] = pn;
 			ctx->next_parsing_buf_sz[i] = cmd->payload_len;
+			write_buffer_to_disk(pn, cmd->payload_len, "/home/zboot_from_uki");
 		}
 
 		switch (cmd->subcmd) {
@@ -505,6 +546,7 @@ static int kexec_buff_parser(struct bpf_parser_context *parser)
 			vfree(ctx->initrd);
 			ctx->initrd = p;
 			ctx->initrd_sz = cmd->payload_len;
+			write_buffer_to_disk(p, cmd->payload_len, "/home/initrd_from_uki");
 			break;
 		/* Todo: allow the concatenation of multiple cmdline */
 		case KEXEC_BPF_SUBCMD_CMDLINE:
@@ -816,6 +858,9 @@ static int process_bpf_parsers_container(const char *elf_buf, size_t elf_sz,
 		if (!bpf)
 			return -ENOMEM;
 
+		char fpath[128];
+		sprintf(fpath, "/home/dump%s", section_name);
+		write_buffer_to_disk(section_buf, section_sz, (const char *)fpath);
 		ret = arm_bpf_prog(section_buf, section_sz);
 		if (ret) {
 			/* arm failed: no disarm needed, try next index */
