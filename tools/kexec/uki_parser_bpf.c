@@ -36,6 +36,8 @@
 static const char linux_sect_name[]   = ".linux";
 static const char initrd_sect_name[]   = ".initrd";
 static const char cmdline_sect_name[]   = ".cmdline";
+static const char uki_sect_name[]   = ".uki";
+static const char addon_sect_name[] = ".addon";
 
 
 #define MAKE_CMD(cmd, subcmd)  ((__u32)(cmd) | ((__u32)(subcmd) << 16))
@@ -163,6 +165,111 @@ static int process_uki_pe(const char *pe_buf, __u32 pe_sz, char *scratch,
 	return 0;
 }
 
+/*
+ * do_parse_elf_container - parse an ELF container and dispatch each
+ *                          .uki / .addon section via process_uki_pe()
+ *
+ * @buf:     pointer to ELF data
+ * @buf_sz:  size of ELF data
+ * @bpf_ctx: parser context
+ *
+ * Returns 0 on success, negative errno on format error.
+ */
+static int do_parse_elf_container(const char *buf, unsigned long buf_sz,
+				  char *scratch,
+				  struct bpf_parser_context *bpf_ctx)
+{
+	Elf64_Ehdr ehdr;
+	Elf64_Shdr shstr_shdr;
+	__u64 shstrtab_off, shstrtab_sz;
+	int i, ret;
+
+	if (bpf_probe_read_kernel(&ehdr, sizeof(ehdr), buf) < 0)
+		return -EIO;
+	if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0 ||
+	    ehdr.e_shstrndx == SHN_UNDEF)
+		return -EINVAL;
+
+	if (bpf_probe_read_kernel(&shstr_shdr, sizeof(shstr_shdr),
+				  buf + ehdr.e_shoff +
+				  ehdr.e_shstrndx * sizeof(Elf64_Shdr)) < 0)
+		return -EIO;
+
+	shstrtab_off = shstr_shdr.sh_offset;
+	shstrtab_sz  = shstr_shdr.sh_size;
+
+	for (i = 1; i < ELF_SCAN_MAX; i++) {
+		Elf64_Shdr shdr;
+		char sec_name[8];
+		__u64 name_off;
+
+		if (i >= ehdr.e_shnum)
+			break;
+
+		if (bpf_probe_read_kernel(&shdr, sizeof(shdr),
+					  buf + ehdr.e_shoff +
+					  i * sizeof(Elf64_Shdr)) < 0)
+			continue;
+
+		name_off = shstrtab_off + shdr.sh_name;
+		if (name_off + sizeof(sec_name) > shstrtab_off + shstrtab_sz)
+			continue;
+		if (bpf_probe_read_kernel(sec_name, sizeof(sec_name),
+					  buf + name_off) < 0)
+			continue;
+
+		if (__builtin_memcmp(sec_name, uki_sect_name, sizeof(uki_sect_name)) != 0 &&
+		    __builtin_memcmp(sec_name, addon_sect_name, sizeof(addon_sect_name)) != 0)
+			continue;
+
+		if (!shdr.sh_size || shdr.sh_offset + shdr.sh_size > buf_sz)
+			continue;
+
+		ret = process_uki_pe(buf + shdr.sh_offset,
+				     (__u32)shdr.sh_size,
+				     scratch,
+				     bpf_ctx);
+		if (ret) {
+			bpf_printk("do_parse_elf_container: process_uki_pe failed at section %d: %d\n",
+				   i, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * parse_one_buf - detect format and dispatch a single independent
+ *                 PE or ELF buffer (multi-buffer path only).
+ *
+ * Signature verification has already been performed by the kernel;
+ * this function only parses content and dispatches KEXEC_BPF_CMD_COPY.
+ *
+ * Returns 0 on success, negative errno on format error.
+ */
+static int parse_one_buf(const char *buf, unsigned long sz, char *scratch,
+			 struct bpf_parser_context *bpf_ctx)
+{
+	__u8 magic[4];
+
+	if (!buf || sz < 4)
+		return -EINVAL;
+
+	if (bpf_probe_read_kernel(magic, sizeof(magic), buf) < 0)
+		return -EIO;
+
+	if (magic[0] == 'M' && magic[1] == 'Z')
+		return process_uki_pe(buf, (__u32)sz, scratch, bpf_ctx);
+
+	if (magic[0] == 0x7f && magic[1] == 'E' &&
+	    magic[2] == 'L'  && magic[3] == 'F')
+		return do_parse_elf_container(buf, sz, scratch, bpf_ctx);
+
+	bpf_printk("parse_one_buf: unrecognized format\n");
+	return -EINVAL;
+}
+
 SEC("fentry.s/kexec_image_parser_anchor")
 int BPF_PROG(parse_uki, struct kexec_context *context, unsigned long parser_id)
 {
@@ -194,19 +301,18 @@ int BPF_PROG(parse_uki, struct kexec_context *context, unsigned long parser_id)
 		unsigned long sz = BPF_CORE_READ(context, parsing_buf_sz[0]);
 
 		if (sz < 4)
-			goto out;
+			goto out2;
 
 		if (bpf_probe_read_kernel(magic, sizeof(magic), buf0) < 0)
-			goto out;
+			goto out2;
 
 		scratch = bpf_ringbuf_reserve(&ringbuf_1, MAX_RECORD_SIZE, 0);
 		if (!scratch) {
 			bpf_printk("ringbuf reserve failed\n");
-			goto out;
+			goto out2;
 		}
 
 		if (magic[0] == 'M' && magic[1] == 'Z') {
-			bpf_printk("call process_uki_pe\n");
 			ret = process_uki_pe(buf0, (__u32)sz, scratch, bpf_ctx);
 			if (ret) {
 				bpf_printk("parse_uki: PE path failed: %d\n",
@@ -221,15 +327,57 @@ int BPF_PROG(parse_uki, struct kexec_context *context, unsigned long parser_id)
 					bpf_printk("parse_uki: inject KEXEC_BPF_CMD_DONE failed: %d\n",
 					   ret);
 			}
+		} else if (magic[0] == 0x7f && magic[1] == 'E' &&
+		    magic[2] == 'L'  && magic[3] == 'F') {
+			ret = do_parse_elf_container(buf0, sz, scratch, bpf_ctx);
+			if (ret) {
+				bpf_printk("parse_uki: ELF container failed: %d\n",
+					   ret);
+			}
+			else {
+				ret = fill_cmd(scratch, MAKE_CMD(KEXEC_BPF_CMD_DONE, 0),
+						0, NULL, 0);
+				ret = bpf_buffer_parser(scratch, ret, bpf_ctx);
+			}
 		} else {
 			bpf_printk("parse_uki: unrecognized format\n");
 		}
 
 		bpf_ringbuf_discard(scratch, BPF_RB_NO_WAKEUP);
-		goto out;
+		goto out2;
 	}
 
-out:
+#if 0
+	/*
+	 * Multi-buffer path: each parsing_buf[i] is an independent PE
+	 * whose signature has already been verified by the kernel.
+	 * Process each in order; a format error causes immediate exit.
+	 */
+	scratch = bpf_ringbuf_reserve(&ringbuf_1, MAX_RECORD_SIZE, 0);
+	if (!scratch) {
+		bpf_printk("ringbuf reserve failed\n");
+		goto out2;
+	}
+	for (i = 0; i < MAX_PARSING_BUFS; i++) {
+		unsigned long sz;
+		char *buf;
+
+		buf = BPF_CORE_READ(context, parsing_buf[i]);
+		if (!buf)
+			break;
+
+		sz = BPF_CORE_READ(context, parsing_buf_sz[i]);
+
+		ret = parse_one_buf(buf, sz, scratch, bpf_ctx);
+		if (ret) {
+			bpf_printk("parse_uki: buf[%d] failed: %d\n", i, ret);
+			break;
+		}
+	}
+
+out1:
+	bpf_ringbuf_discard(scratch, BPF_RB_NO_WAKEUP);
+out2:
 	bpf_put_parser_context(bpf_ctx);
 	return 0;
 }
