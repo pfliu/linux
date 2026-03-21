@@ -39,6 +39,37 @@ ifdef ELF_MACHINE
 endif
 
 # ---------------------------------------------------------------------------
+# BPF file signing — identical to kernel module signing (append style)
+#
+# sign-file appends a PKCS#7 DER blob + struct module_signature + magic tail
+# to the file in-place, exactly as it does for .ko files.  The kernel's
+# mod_verify_sig() / verify_pkcs7_signature() path is therefore reused
+# without any modification on the verification side.
+#
+# Signing is enabled automatically when both key and certificate exist.
+# Override at the command line if needed:
+#   make SIGNING_KEY=/path/to/key.pem SIGNING_CERT=/path/to/cert.pem
+#
+# To disable signing even when the files exist:
+#   make KBUILD_SIGN_BPF=n
+# ---------------------------------------------------------------------------
+CONFIG_MODULE_SIG_HASH ?= sha256
+SIGN_FILE    := $(srctree)/scripts/sign-file
+SIGNING_KEY  ?= $(srctree)/certs/signing_key.pem
+SIGNING_CERT ?= $(srctree)/certs/signing_key.x509
+
+# Auto-detect: enable only when sign-file tool and both key/cert are present
+ifeq ($(KBUILD_SIGN_BPF),)
+  ifneq ($(wildcard $(SIGN_FILE)),)
+    ifneq ($(wildcard $(SIGNING_KEY)),)
+      ifneq ($(wildcard $(SIGNING_CERT)),)
+        KBUILD_SIGN_BPF := y
+      endif
+    endif
+  endif
+endif
+
+# ---------------------------------------------------------------------------
 # zboot ELF image parameters
 # INITRAMFS: path to the initramfs image (required)
 # CMDLINE:   kernel command line string (optional, defaults to empty)
@@ -62,7 +93,8 @@ HEADERS = vmlinux.h bpf_helper_defs.h image_size.h
 #   <P>_parser_bpf.lskel.h - light skeleton header
 #   <P>_bytecode.c         - extracted opts_data / opts_insn arrays
 #   <P>_bytecode.o         - compiled bytecode object
-#   <P>.bpf                - final ELF wrapper with .bpf.1 section
+#   <P>.bpf                - final ELF wrapper with .bpf.1 section (signed
+#                            in-place when KBUILD_SIGN_BPF=y)
 # ---------------------------------------------------------------------------
 BPF_TARGETS = zboot
 BPF_TARGETS += uki
@@ -178,6 +210,12 @@ only_section_flags = $(foreach m,$(1),--only-section=$(call section_name,$(m)))
 # objcopy does not guarantee section order when all --add-section flags are
 # given in a single invocation, so we chain N calls through a .work.o file
 # to preserve the declared order.
+#
+# After the ELF wrapper is assembled, sign-file is invoked when
+# KBUILD_SIGN_BPF=y.  It appends:
+#   [ PKCS#7 DER signature ][ struct module_signature ][ MODULE_SIG_STRING ]
+# to the file in-place — identical to the .ko signing scheme — so the kernel
+# can verify the file through the standard mod_verify_sig() path.
 # ---------------------------------------------------------------------------
 define BPF_WRAPPER_RULE
 $(1).bpf: $(foreach m,$($(2)_BPF_MAPS),$(call source_file,$(m)))
@@ -189,6 +227,10 @@ $(1).bpf: $(foreach m,$($(2)_BPF_MAPS),$(call source_file,$(m)))
 	)
 	@objcopy $(call only_section_flags,$($(2)_BPF_MAPS)) $$@.work.o $$@
 	@rm -f $$@.work.o
+ifeq ($(KBUILD_SIGN_BPF),y)
+	@echo "  SIGN [bpf] $$@"
+	@$(SIGN_FILE) $(CONFIG_MODULE_SIG_HASH) $(SIGNING_KEY) $(SIGNING_CERT) $$@
+endif
 endef
 
 $(eval $(call BPF_WRAPPER_RULE,zboot,ZBOOT))

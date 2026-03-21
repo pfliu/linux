@@ -18,6 +18,8 @@
 #include <linux/string.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <linux/module_signature.h>
+#include <linux/verification.h>
 #include <asm/byteorder.h>
 #include <linux/decompress/generic.h>
 #include "kexec_internal.h"
@@ -126,9 +128,16 @@ static void disarm_bpf_prog(void)
 
 #define MAX_PARSING_BUF_NUM    16
 
+typedef enum {
+	SIG_ENFORCE_NONE = 0,
+	SIG_ENFORCE_SIG  = 1,
+	SIG_ENFORCE_IMA  = 2,
+} kexec_sig_enforced;
+
 struct kexec_context {
 	bool kdump;
 	bool parsed;
+	kexec_sig_enforced sig_mode;
 	char *parsing_buf[MAX_PARSING_BUF_NUM];
 	unsigned long parsing_buf_sz[MAX_PARSING_BUF_NUM];
 	char *next_parsing_buf[MAX_PARSING_BUF_NUM];
@@ -171,6 +180,7 @@ late_initcall(kexec_bpf_prog_run_init);
 #define KEXEC_BPF_CMD_DONE		0x1
 #define KEXEC_BPF_CMD_DECOMPRESS	0x2
 #define KEXEC_BPF_CMD_COPY		0x3
+#define KEXEC_BPF_CMD_VERIFY_SIG	0x4
 
 #define KEXEC_BPF_SUBCMD_INVALID	0x0
 #define KEXEC_BPF_SUBCMD_KERNEL		0x1
@@ -433,6 +443,72 @@ static int elf_get_shstrtab(const char *buf, size_t sz,
 }
 
 /*
+ * verify_elf_sig - verify PKCS#7 signature appended to a signed ELF
+ * @payload: pointer to ELF data
+ * @pay_len: length of ELF data including appended signature trailer
+ *
+ * The appended signature format is produced by scripts/sign-file:
+ *
+ *   [ ELF data ][ PKCS#7 ][ struct module_signature ][ MODULE_SIG_STRING ]
+ *
+ * Verification is attempted against secondary trusted keyring, then
+ * platform keyring.
+ *
+ * Returns 0 on success, negative errno otherwise.
+ */
+static int verify_elf_sig(const char *payload, u32 pay_len)
+{
+	const struct module_signature *ms;
+	size_t sig_len, data_len = pay_len;
+	int ret;
+
+	if (pay_len <= sizeof(MODULE_SIG_STRING) - 1 + sizeof(*ms))
+		goto no_sig;
+
+	data_len -= sizeof(MODULE_SIG_STRING) - 1;
+	if (memcmp(payload + data_len, MODULE_SIG_STRING,
+		   sizeof(MODULE_SIG_STRING) - 1) != 0)
+		goto no_sig;
+
+	data_len -= sizeof(*ms);
+	ms = (const struct module_signature *)(payload + data_len);
+
+	sig_len = be32_to_cpu(ms->sig_len);
+	if (sig_len == 0 || sig_len > data_len) {
+		pr_err("kexec verify_sig_elf: malformed signature trailer\n");
+		return -EBADMSG;
+	}
+
+	data_len -= sig_len;
+
+	ret = verify_pkcs7_signature(payload, data_len, payload + data_len,
+				     sig_len, VERIFY_USE_SECONDARY_KEYRING,
+				     VERIFYING_MODULE_SIGNATURE, NULL, NULL);
+	if (ret) {
+		pr_debug(
+			"kexec verify_sig_elf: secondary keyring failed (%d), trying platform\n",
+			ret);
+		ret = verify_pkcs7_signature(payload, data_len,
+					     payload + data_len, sig_len,
+					     VERIFY_USE_PLATFORM_KEYRING,
+					     VERIFYING_MODULE_SIGNATURE, NULL,
+					     NULL);
+	}
+
+	if (ret)
+		pr_err("kexec verify_sig_elf: signature verification failed: %d\n",
+		       ret);
+	return ret;
+
+no_sig:
+	if (get_kexec_sig_enforced()) {
+		pr_err("kexec verify_sig_elf: missing signature and sig_enforce is set\n");
+		return -EKEYREJECTED;
+	}
+	return 0;
+}
+
+/*
  * validate_elf_bpf_sections - enforce the section-naming contract
  * @buf: ELF image buffer
  * @sz:  buffer length
@@ -530,6 +606,12 @@ static int validate_elf_bpf_sections(const char *buf, size_t sz)
 			return -EINVAL;
 		}
 	}
+
+	/* It is right format, now check its signature */
+	ret = verify_elf_sig(buf, sz);
+	if (ret)
+		return ret;
+
 
 	return 0;
 }
@@ -735,11 +817,10 @@ int decompose_kexec_image(struct kimage *image, int extended_fd)
 
 	if (!validate_elf_bpf_sections(parser_start, parser_sz)) {
 
-		/*
-		 * TODO: Verify the ELF signature.
-		 * It is signed in the same manner as the kernel module.
-		 */
-
+		/* It is right format, now check its signature */
+		ret = verify_elf_sig(parser_start, parser_sz);
+		if (ret)
+			return ret;
 		ret = kernel_read_file_from_fd(extended_fd,
 						0,
 						(void **)&ctx.parsing_buf[0],

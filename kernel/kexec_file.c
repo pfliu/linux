@@ -36,6 +36,11 @@ void set_kexec_sig_enforced(void)
 {
 	sig_enforce = true;
 }
+
+bool get_kexec_sig_enforced(void)
+{
+	return sig_enforce;
+}
 #endif
 
 #ifdef CONFIG_IMA_KEXEC

@@ -548,8 +548,10 @@ static inline void kimage_unmap_segment(void *buffer) { }
 
 #ifdef CONFIG_KEXEC_SIG
 void set_kexec_sig_enforced(void);
+bool get_kexec_sig_enforced(void);
 #else
 static inline void set_kexec_sig_enforced(void) {}
+static inline bool get_kexec_sig_enforced(void) { return false; }
 #endif
 
 #endif /* !defined(__ASSEBMLY__) */
