@@ -902,25 +902,14 @@ out_free_sha_regions:
 	return ret;
 }
 
-#ifdef CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY
-/*
- * kexec_purgatory_find_symbol - find a symbol in the purgatory
- * @pi:		Purgatory to search in.
- * @name:	Name of the symbol.
- *
- * Return: pointer to symbol in read-only symtab on success, NULL on error.
- */
-static const Elf_Sym *kexec_purgatory_find_symbol(struct purgatory_info *pi,
-						  const char *name)
+#if defined(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY) || defined(CONFIG_KEXEC_BPF)
+const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, const char *name)
 {
 	const Elf_Shdr *sechdrs;
 	const Elf_Ehdr *ehdr;
 	const Elf_Sym *syms;
 	const char *strtab;
 	int i, k;
-
-	if (!pi->ehdr)
-		return NULL;
 
 	ehdr = pi->ehdr;
 	sechdrs = (void *)ehdr + ehdr->e_shoff;
@@ -956,6 +945,23 @@ static const Elf_Sym *kexec_purgatory_find_symbol(struct purgatory_info *pi,
 	}
 
 	return NULL;
+}
+#endif
+
+#ifdef CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY
+/*
+ * kexec_purgatory_find_symbol - find a symbol in the purgatory
+ * @pi:		Purgatory to search in.
+ * @name:	Name of the symbol.
+ *
+ * Return: pointer to symbol in read-only symtab on success, NULL on error.
+ */
+static const Elf_Sym *kexec_purgatory_find_symbol(struct purgatory_info *pi,
+						  const char *name)
+{
+	if (!pi->ehdr)
+		return NULL;
+	return elf_find_symbol(pi->ehdr, name);
 }
 /*
  * kexec_purgatory_setup_kbuf - prepare buffer to load purgatory.
