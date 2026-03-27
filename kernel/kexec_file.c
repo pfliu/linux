@@ -903,7 +903,17 @@ out_free_sha_regions:
 }
 
 #if defined(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY) || defined(CONFIG_KEXEC_BPF)
-const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, const char *name)
+
+/*
+ * Validate that a region [ptr, ptr+size) lies entirely within
+ * [base, base+buf_size).
+ */
+#define VALIDATE_ELF_REGION(base, buf_size, ptr, size)              \
+	((uintptr_t)(ptr) >= (uintptr_t)(base) &&             \
+	 (uintptr_t)(ptr) < (uintptr_t)(base) + (buf_size) && \
+	 (size) <= (uintptr_t)(base) + (buf_size) - (uintptr_t)(ptr))
+
+const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, size_t elf_sz, const char *name)
 {
 	const Elf_Shdr *sechdrs;
 	const Elf_Ehdr *ehdr;
@@ -921,15 +931,33 @@ const Elf_Sym *elf_find_symbol(const Elf_Ehdr *ehdr, const char *name)
 		if (sechdrs[i].sh_link >= ehdr->e_shnum)
 			/* Invalid strtab section number */
 			continue;
+
+		/* validate strtab section */
 		strtab = (void *)ehdr + sechdrs[sechdrs[i].sh_link].sh_offset;
-		syms = (void *)ehdr + sechdrs[i].sh_offset;
+		size_t strtab_size = sechdrs[sechdrs[i].sh_link].sh_size;
+		if (!VALIDATE_ELF_REGION(ehdr, elf_size, strtab, strtab_size))
+			continue;
+		strtab_end = strtab + strtab_size;
+
+		/* validate symtab section */
+		syms = (const void *)ehdr + sechdrs[i].sh_offset;
+		if (!VALIDATE_ELF_REGION(ehdr, elf_size, syms, sechdrs[i].sh_size))
+			continue;
 
 		/* Go through symbols for a match */
 		for (k = 0; k < sechdrs[i].sh_size/sizeof(Elf_Sym); k++) {
 			if (ELF_ST_BIND(syms[k].st_info) != STB_GLOBAL)
 				continue;
 
-			if (strcmp(strtab + syms[k].st_name, name) != 0)
+			/* validate st_name offset into strtab */
+			if (syms[k].st_name >= strtab_size)
+				continue;
+
+			sym_name = strtab + syms[k].st_name;
+			/* Ensure the string is null-terminated */
+			if (memchr(sym_name, '\0', strtab_end - sym_name) == NULL)
+				continue;
+			if (strcmp(sym_name, name) != 0)
 				continue;
 
 			if (syms[k].st_shndx == SHN_UNDEF ||
@@ -961,7 +989,7 @@ static const Elf_Sym *kexec_purgatory_find_symbol(struct purgatory_info *pi,
 {
 	if (!pi->ehdr)
 		return NULL;
-	return elf_find_symbol(pi->ehdr, name);
+	return elf_find_symbol(pi->ehdr, kexec_purgatory_size, name);
 }
 /*
  * kexec_purgatory_setup_kbuf - prepare buffer to load purgatory.
