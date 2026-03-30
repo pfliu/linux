@@ -9,7 +9,7 @@
 
 /* ringbuf 2,3,4 are useless */
 #define MIN_BUF_SIZE    1
-#define MAX_RECORD_SIZE (IMAGE_SIZE + 40960)
+#define MAX_RECORD_SIZE IMAGE_SIZE
 #define RINGBUF1_SIZE   IMAGE_SIZE_POWER2_ALIGN
 #define RINGBUF2_SIZE   MIN_BUF_SIZE
 #define RINGBUF3_SIZE   MIN_BUF_SIZE
@@ -55,6 +55,7 @@ static const char cmdline_sect_name[]   = ".cmdline";
  * payload_len directly describes the raw data length.
  *
  * Returns the total byte count to pass to bpf_buffer_parser().
+ * Returns -1 if error.
  */
 static int fill_cmd(char *buf, __u16 cmd, __u16 subcmd,
 				    const char *src, __u32 data_len)
@@ -65,6 +66,7 @@ static int fill_cmd(char *buf, __u16 cmd, __u16 subcmd,
 	hdr              = (struct cmd_hdr *)buf;
 	hdr->cmd         = cmd;
 	hdr->subcmd      = subcmd;
+	hdr->pipeline_flag = 0;
 	hdr->payload_len = data_len;
 	hdr->num_chunks  = 0;
 
@@ -73,8 +75,9 @@ static int fill_cmd(char *buf, __u16 cmd, __u16 subcmd,
 	if (!src || !data_len)
 		return sizeof(*hdr);
 	if (data_len > MAX_RECORD_SIZE - sizeof(struct cmd_hdr))
-		return 0;
-	bpf_probe_read_kernel(payload, data_len, src);
+		return -1;
+	if (bpf_probe_read_kernel(payload, data_len, src) < 0)
+		return -1;
 
 	return sizeof(*hdr) + data_len;
 }
@@ -115,12 +118,20 @@ static int do_zboot_decompress(char *ringbuf, const char *pe_buf,
 				 0,
 				 pe_buf,
 				 pe_sz);
+		if (total < 0 )
+			return -EINVAL;
 		ret = bpf_buffer_parser(ringbuf, total, bpf);
 		if (ret < 0) {
 			bpf_printk("do_zboot_decompress: VERIFY_SIG failed: %d\n",
 				   ret);
 			return ret;
 		}
+	}
+
+	if (buf_size < sizeof(zboot_header)) {
+		bpf_printk("do_zboot_decompress: buffer too small "
+				"(%zu < %zu)\n", buf_size, sizeof(zboot_header));
+		return -EINVAL;
 	}
 
 	/* Read and validate zboot header */
@@ -164,7 +175,8 @@ static int do_zboot_decompress(char *ringbuf, const char *pe_buf,
 			 KEXEC_BPF_SUBCMD_KERNEL,
 			 pe_buf + payload_offset,
 			 payload_size - 4);
-
+	if (total < 0 )
+		return -EINVAL;
 	bpf_printk("do_zboot_decompress: calling bpf_buffer_parser() for DECOMPRESS\n");
 	ret = bpf_buffer_parser(ringbuf, total, bpf);
 	if (ret < 0) {
@@ -253,6 +265,22 @@ int BPF_PROG(parse_zboot, struct kexec_context *context, unsigned long parser_id
 		bpf_printk("parse_zboot: invalid ELF section info\n");
 		goto discard;
 	}
+	if (ehdr.e_shoff > buf_sz) {
+		bpf_printk("parse_zboot: e_shoff out of bounds\n");
+		goto discard;
+	}
+	u64 shdr_table_size;
+	if (check_mul_overflow((u64)ehdr.e_shnum, (u64)sizeof(Elf64_Shdr),
+			       &shdr_table_size) ||
+	    shdr_table_size > buf_sz - ehdr.e_shoff) {
+	
+		bpf_printk("parse_zboot: section header table out of bounds\n");
+		goto discard;
+	}
+	if (ehdr.e_shstrndx >= ehdr.e_shnum) {
+		bpf_printk("parse_zboot: e_shstrndx out of bounds\n");
+		goto discard;
+	}
 
 	if (bpf_probe_read_kernel(&shstr_shdr, sizeof(shstr_shdr),
 				  buf_elf + ehdr.e_shoff +
@@ -283,7 +311,9 @@ int BPF_PROG(parse_zboot, struct kexec_context *context, unsigned long parser_id
 					  buf_elf + name_off) < 0)
 			continue;
 
-		if (!shdr.sh_size || shdr.sh_offset + shdr.sh_size > buf_sz)
+		if (!shdr.sh_size || shdr.sh_size > U32_MAX)
+			continue;
+		if (shdr.sh_offset > buf_sz || shdr.sh_size > buf_sz - shdr.sh_offset)
 			continue;
 
 		/* .initrd */
@@ -293,6 +323,8 @@ int BPF_PROG(parse_zboot, struct kexec_context *context, unsigned long parser_id
 					 KEXEC_BPF_SUBCMD_INITRD,
 					 buf_elf + shdr.sh_offset,
 					 (__u32)shdr.sh_size);
+			if (total < 0)
+				continue;
 			ret = bpf_buffer_parser(ringbuf, total, bpf);
 			if (ret < 0) {
 				bpf_printk("parse_zboot: COPY initrd failed: %d\n",
@@ -309,6 +341,8 @@ int BPF_PROG(parse_zboot, struct kexec_context *context, unsigned long parser_id
 					 KEXEC_BPF_SUBCMD_CMDLINE,
 					 buf_elf + shdr.sh_offset,
 					 (__u32)shdr.sh_size);
+			if (total < 0)
+				continue;
 			ret = bpf_buffer_parser(ringbuf, total, bpf);
 			if (ret < 0) {
 				bpf_printk("parse_zboot: COPY cmdline failed: %d\n",
@@ -333,6 +367,8 @@ int BPF_PROG(parse_zboot, struct kexec_context *context, unsigned long parser_id
 done:
 	/* Notify kernel that this BPF prog completed successfully */
 	total = fill_cmd(ringbuf, KEXEC_BPF_CMD_DONE, 0, NULL, 0);
+	if (total < 0)
+		continue;
 	ret = bpf_buffer_parser(ringbuf, total, bpf);
 	if (ret < 0) {
 		bpf_printk("parse_zboot: KEXEC_BPF_CMD_DONE, failed: %d\n", ret);

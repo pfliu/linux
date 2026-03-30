@@ -15,8 +15,7 @@ ifeq ($(ARCH),$(filter $(ARCH),arm64 riscv loongarch))
 	EFI_IMAGE := $(srctree)/arch/$(ARCH)/boot/vmlinuz.efi
 	KERNEL_IMAGE := $(srctree)/arch/$(ARCH)/boot/vmlinux.bin
 else
-	@echo "Unsupported architecture: $(ARCH)"
-	@exit 1
+	$(error Unsupported architecture: $(ARCH))
 endif
 
 CC = clang
@@ -73,7 +72,8 @@ bpf_helper_defs.h: $(srctree)/tools/include/uapi/linux/bpf.h
 # Default estimated size for initramfs (can be overridden by user)
 INITRD_ESTIMATE_SIZE ?= 67108864   # 64MB
 
-# In worst case, this image includes vmlinuz.efi, initramfs and cmdline
+# This combined image includes vmlinuz.efi, initramfs, and cmdline.
+# The size is roughly equivalent to a UKI image.
 image_size.h: $(KERNEL_IMAGE)
 	@{ \
 		if [ ! -f "$(KERNEL_IMAGE)" ]; then \
@@ -81,8 +81,8 @@ image_size.h: $(KERNEL_IMAGE)
 			exit 1; \
 		fi; \
 		KERNEL_SIZE=$$(stat -c '%s' "$(KERNEL_IMAGE)" 2>/dev/null); \
-		ELF_OVERHEAD=4096; \
-		TOTAL_SIZE=$$((KERNEL_SIZE + $(INITRD_ESTIMATE_SIZE) + ELF_OVERHEAD)); \
+		OVERHEAD=40960; \
+		TOTAL_SIZE=$$((KERNEL_SIZE + $(INITRD_ESTIMATE_SIZE) + OVERHEAD)); \
 		POWER=4096; \
 		while [ $$POWER -le $$TOTAL_SIZE ]; do \
 			POWER=$$((POWER * 2)); \
